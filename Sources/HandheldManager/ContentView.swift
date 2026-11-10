@@ -55,6 +55,17 @@ struct ContentView: View {
         .navigationSplitViewStyle(.balanced)
         .task { await model.refresh() }
         .onChange(of: model.selectedSerial) { _, value in Task { await model.chooseDevice(value) } }
+        .alert(model.finalConfirmation?.title ?? "", isPresented: Binding(
+            get: { model.finalConfirmation != nil },
+            set: { if !$0 { model.finalConfirmation = nil } }
+        )) {
+            Button(model.finalConfirmation?.confirmLabel ?? "OK", role: .destructive) {
+                let action = model.finalConfirmation?.action
+                model.finalConfirmation = nil
+                action?()
+            }
+            Button("Abbrechen", role: .cancel) { model.finalConfirmation = nil }
+        } message: { Text(model.finalConfirmation?.message ?? "") }
         .alert("Aktion fehlgeschlagen", isPresented: Binding(
             get: { model.errorMessage != nil },
             set: { if !$0 { model.errorMessage = nil } }
@@ -117,19 +128,17 @@ private struct DeviceOverviewView: View {
     let open: (ManagerTab) -> Void
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
-                if let device = model.descriptor {
+        if let device = model.descriptor {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
                     header(device)
                     actions(device)
                     emulators(device)
                     technicalDetails(device)
-                } else if let connection = model.selectedConnection {
-                    ContentUnavailableView("ADB-Freigabe fehlt", systemImage: "lock.shield", description: Text("Entsperre \(connection.displayName) und bestätige den RSA-Fingerprint für dieses Gerät. Status: \(connection.state)."))
-                } else {
-                    ContentUnavailableView("Kein Handheld verbunden", systemImage: "cable.connector.slash", description: Text("Verbinde das Gerät per USB, aktiviere USB-Debugging und bestätige den RSA-Fingerprint am Handheld."))
-                }
-            }.padding(24).frame(maxWidth: 820, alignment: .leading).frame(maxWidth: .infinity)
+                }.padding(24).frame(maxWidth: 820, alignment: .leading).frame(maxWidth: .infinity)
+            }
+        } else {
+            SetupGuideView(connection: model.selectedConnection)
         }
     }
 
@@ -243,6 +252,51 @@ private struct DeviceOverviewView: View {
     }
     private func color(for state: CapabilityState) -> Color {
         switch state { case .supported: return .green; case .unavailable: return .secondary; case .requiresOnDeviceAction: return .orange; case .unknown: return .secondary }
+    }
+}
+
+private struct SetupGuideView: View {
+    @EnvironmentObject private var model: AppModel
+    let connection: DeviceConnection?
+
+    private var waitingForApproval: Bool { connection != nil }
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 20) {
+                Image(systemName: waitingForApproval ? "lock.shield" : "cable.connector.slash")
+                    .font(.system(size: 44, weight: .light)).foregroundStyle(.secondary)
+                Text(waitingForApproval ? "Freigabe am Handheld fehlt" : "Kein Handheld verbunden").font(.title2.weight(.semibold))
+                Text(waitingForApproval
+                     ? "Das Gerät ist verbunden, aber noch nicht für diesen Mac freigegeben (Status: \(connection?.state ?? "")). Entsperre das Handheld und bestätige die Abfrage."
+                     : "So richtest du dein Android-Handheld ein. Das ist einmalig.")
+                    .foregroundStyle(.secondary).multilineTextAlignment(.center)
+                VStack(alignment: .leading, spacing: 12) {
+                    step(1, "Entwickleroptionen freischalten", "Öffne Einstellungen → System → Über das Gerät (je nach Gerät auch „Über das Telefon“). Tippe siebenmal schnell auf die Build-Nummer. Android meldet „Du bist jetzt Entwickler“.", done: false)
+                    step(2, "USB-Debugging einschalten", "Öffne Einstellungen → System → Entwickleroptionen und aktiviere „USB-Debugging“. Bestätige die Sicherheitsabfrage mit OK.", done: false)
+                    step(3, "Per USB verbinden", "Nimm ein Datenkabel (kein reines Ladekabel) und stecke es direkt an den Mac. Falls Android nach dem USB-Modus fragt, wähle „Dateiübertragung“.", done: connection != nil)
+                    step(4, "Am Handheld freigeben", "Beim ersten Verbinden erscheint „USB-Debugging zulassen?“ mit dem Fingerabdruck deines Macs. Hake „Immer von diesem Computer zulassen“ an und tippe auf „Zulassen“. Das Gerät muss dabei entsperrt sein.", done: false, highlight: waitingForApproval)
+                }
+                .frame(maxWidth: 560, alignment: .leading)
+                Button("Erneut suchen", systemImage: "arrow.clockwise") { Task { await model.refresh() } }
+                    .buttonStyle(.borderedProminent).disabled(model.isBusy)
+            }
+            .padding(32).frame(maxWidth: .infinity)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func step(_ number: Int, _ title: LocalizedStringKey, _ text: LocalizedStringKey, done: Bool, highlight: Bool = false) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: done ? "checkmark.circle.fill" : "\(number).circle.fill")
+                .font(.title2).foregroundStyle(done ? Color.green : (highlight ? Color.orange : Color.accentColor))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(.headline)
+                Text(text).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(12).frame(maxWidth: .infinity, alignment: .leading)
+        .background(highlight ? Color.orange.opacity(0.12) : Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 }
 
@@ -384,16 +438,18 @@ private struct DeviceFilesView: View {
             Text(uploadConfirmationText)
         }
         .alert("Datei oder Ordner in Quarantäne verschieben?", isPresented: $confirmQuarantine) {
-            Button("Verschieben", role: .destructive) { Task { await model.quarantineSelected() } }
+            Button("Verschieben", role: .destructive) { model.confirmAgain("Wirklich in Quarantäne verschieben?", "Die Dateien werden in den Papierkorb (Quarantäne) auf dem Handheld verschoben und lassen sich zurückholen.", label: "Ja, verschieben") { Task { await model.quarantineSelected() } } }
             Button("Abbrechen", role: .cancel) { }
         } message: { Text(quarantineConfirmationText) }
         .confirmationDialog("Einträge endgültig löschen?", isPresented: $confirmPermanentDelete, titleVisibility: .visible) {
             Button("Endgültig löschen", role: .destructive) {
                 let entries = pendingDeleteEntries
-                Task {
-                    await model.deleteSelectedPermanently(entries)
-                    selectedPaths.subtract(entries.map(\.path))
-                    pendingDeleteEntries = []
+                model.confirmAgain("Wirklich endgültig löschen?", "\(entries.count) Eintrag/Einträge werden dauerhaft gelöscht. Zur Sicherheit noch einmal: Das Löschen kann nicht rückgängig gemacht werden.") {
+                    Task {
+                        await model.deleteSelectedPermanently(entries)
+                        selectedPaths.subtract(entries.map(\.path))
+                        pendingDeleteEntries = []
+                    }
                 }
             }
             Button("Abbrechen", role: .cancel) { }
@@ -601,10 +657,10 @@ private struct StorageAnalysisView: View {
         }
         .confirmationDialog(pendingDeletion?.isDirectory == true ? "Ordner entfernen?" : "Datei entfernen?", isPresented: $showRemovalOptions, titleVisibility: .visible) {
             Button(pendingDeletion?.isDirectory == true ? "Ordner in Quarantäne verschieben" : "In Quarantäne verschieben") {
-                if let pendingDeletion { Task { await model.quarantineStorageFile(pendingDeletion) } }
+                if let entry = pendingDeletion { model.confirmAgain("Wirklich in Quarantäne verschieben?", "\((entry.path as NSString).lastPathComponent): Die Dateien werden in den Papierkorb (Quarantäne) auf dem Handheld verschoben und lassen sich zurückholen.", label: "Ja, verschieben") { Task { await model.quarantineStorageFile(entry) } } }
             }
             Button(pendingDeletion?.isDirectory == true ? "Ordner samt Inhalt endgültig löschen" : "Endgültig löschen", role: .destructive) {
-                if let pendingDeletion { Task { await model.deleteStorageFilePermanently(pendingDeletion) } }
+                if let entry = pendingDeletion { model.confirmAgain("Wirklich endgültig löschen?", "\((entry.path as NSString).lastPathComponent) wird dauerhaft gelöscht. Zur Sicherheit noch einmal: Das Löschen kann nicht rückgängig gemacht werden.") { Task { await model.deleteStorageFilePermanently(entry) } } }
             }
             Button("Abbrechen", role: .cancel) { pendingDeletion = nil }
         } message: {
@@ -845,6 +901,8 @@ private struct SystemFirmwareView: View {
 private struct AppsLauncherView: View {
     @EnvironmentObject private var model: AppModel
     @State private var showAPKPicker = false
+    @State private var showWallpaperPicker = false
+    @State private var frontendChoice = ""
     @State private var confirmInstall = false
     @State private var confirmDirectInstall = false
     @State private var confirmHomeLauncherChange = false
@@ -852,6 +910,93 @@ private struct AppsLauncherView: View {
     @State private var packagePendingRemoval: InstalledPackage?
 
     private var device: DeviceDescriptor? { model.descriptor }
+
+    private var backupableFrontends: [LauncherOption] {
+        LauncherOption.recommended.filter { option in
+            !option.dataFolders.isEmpty && device?.packages.contains(where: { $0.packageName == option.packageName }) == true
+        }
+    }
+    private var chosenFrontend: LauncherOption? {
+        backupableFrontends.first { $0.packageName == frontendChoice } ?? backupableFrontends.first
+    }
+
+    @ViewBuilder
+    private var frontendDataBox: some View {
+        if let option = chosenFrontend {
+            GroupBox("Frontend-Daten sichern und wiederherstellen") {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Picker("Frontend", selection: Binding(get: { option.packageName }, set: { frontendChoice = $0; model.frontendEntries = []; model.frontendScanMessage = nil })) {
+                            ForEach(backupableFrontends) { Text($0.name).tag($0.packageName) }
+                        }.frame(maxWidth: 260)
+                        Button("Daten suchen", systemImage: "magnifyingglass") { Task { await model.scanFrontendData(option) } }
+                            .disabled(model.isBusy || !model.canWorkWithDevice)
+                        Spacer()
+                        Button("Sicherung wiederherstellen…", systemImage: "arrow.uturn.backward") { chooseFrontendBackup() }
+                            .disabled(model.isBusy || !model.canWorkWithDevice)
+                    }
+                    if let message = model.frontendScanMessage { Text(message).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+                    if !model.frontendEntries.isEmpty {
+                        VStack(spacing: 0) {
+                            ForEach(model.frontendEntries) { entry in
+                                Toggle(isOn: Binding(
+                                    get: { model.frontendSelection.contains(entry.path) },
+                                    set: { on in if on { model.frontendSelection.insert(entry.path) } else { model.frontendSelection.remove(entry.path) } }
+                                )) {
+                                    HStack {
+                                        Image(systemName: entry.isDirectory ? "folder.fill" : "doc.fill").foregroundStyle(.secondary)
+                                        Text(entry.name)
+                                        Spacer()
+                                        Text(entry.sizeBytes.humanBytes).font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                                    }
+                                }.padding(.vertical, 6)
+                                Divider()
+                            }
+                        }
+                        HStack {
+                            Text("Große Medienordner sind vorab abgewählt.").font(.caption).foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Auf dem Mac sichern…", systemImage: "square.and.arrow.down") { backupFrontend(option) }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(model.isBusy || model.frontendSelection.isEmpty)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading).padding(8)
+            }
+        }
+    }
+
+    private func backupFrontend(_ option: LauncherOption) {
+        let panel = NSSavePanel()
+        panel.title = "\(option.name)-Daten sichern"
+        panel.message = "Wähle Name und Ort des Ordners für die Sicherung."
+        panel.prompt = "Sichern"
+        panel.nameFieldStringValue = "\(option.name) Sicherung"
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let directory = panel.url else { return }
+        Task {
+            if let saved = await model.backupFrontendData(option, to: directory) { NSWorkspace.shared.activateFileViewerSelecting([saved]) }
+        }
+    }
+
+    private func chooseFrontendBackup() {
+        let panel = NSOpenPanel()
+        panel.title = "Frontend-Sicherung wählen"
+        panel.message = "Wähle den Ordner einer früheren Sicherung."
+        panel.prompt = "Wählen"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let folder = panel.url else { return }
+        Task { await model.prepareFrontendRestore(from: folder) }
+    }
+
+    private var frontendRestoreMessage: String {
+        guard let plan = model.frontendRestorePlan else { return "" }
+        let date = plan.manifest.createdAt.formatted(date: .abbreviated, time: .shortened)
+        return "\(plan.manifest.items.count) Eintrag/Einträge aus der Sicherung vom \(date). \(plan.existing.count) davon gibt es auf dem Gerät schon; die aktuelle Version wandert in den Papierkorb des Geräts und wird durch die gesicherte ersetzt. Schließe das Frontend vorher auf dem Handheld."
+    }
 
     var body: some View {
         ScrollView {
@@ -901,10 +1046,9 @@ private struct AppsLauncherView: View {
                             VStack(alignment: .leading, spacing: 4) {
                                 Text("Aktueller Launcher")
                                     .font(.headline)
-                                Text(device?.currentHomeActivity?.componentName ?? "Nicht ermittelt")
-                                    .font(.system(.body, design: .monospaced))
-                                    .textSelection(.enabled)
-                                    .foregroundStyle(.secondary)
+                                Text(device?.currentHomeActivity?.displayName ?? "Nicht ermittelt")
+                                    .font(.title3)
+                                    .help(device?.currentHomeActivity?.componentName ?? "")
                             }
                             Spacer()
                             Button("Status aktualisieren") { Task { await model.refreshLauncherInfo() } }
@@ -914,10 +1058,9 @@ private struct AppsLauncherView: View {
                             VStack(alignment: .leading, spacing: 6) {
                                 Text("Erkannte Home-Apps (\(activities.count))").font(.headline)
                                 ForEach(activities) { activity in
-                                    Label(activity.componentName, systemImage: activity.id == device?.currentHomeActivity?.id ? "checkmark.circle.fill" : "app")
-                                        .font(.system(.caption, design: .monospaced))
+                                    Label(activity.displayName, systemImage: activity.id == device?.currentHomeActivity?.id ? "checkmark.circle.fill" : "app")
                                         .foregroundStyle(activity.id == device?.currentHomeActivity?.id ? .green : .secondary)
-                                        .textSelection(.enabled)
+                                        .help(activity.componentName)
                                 }
                             }
                         } else {
@@ -930,7 +1073,7 @@ private struct AppsLauncherView: View {
                                 set: { model.selectedHomePackageName = $0 }
                             )) {
                                 ForEach(device?.homeActivities ?? []) { activity in
-                                    Text("\(activity.packageName) · \(activity.componentName)").tag(activity.packageName)
+                                    Text(activity.displayName).tag(activity.packageName)
                                 }
                             }
                             Button("Launcher remote als Standard setzen…") { confirmHomeLauncherChange = true }
@@ -948,6 +1091,54 @@ private struct AppsLauncherView: View {
                     .padding(8)
                 }
 
+                GroupBox("Launcher & Frontends installieren") {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(LauncherOption.recommended) { option in
+                            let installed = device?.packages.contains(where: { $0.packageName == option.packageName }) == true
+                            HStack(alignment: .center, spacing: 12) {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    HStack(spacing: 6) {
+                                        Text(option.name).font(.headline)
+                                        if installed { Label("Installiert", systemImage: "checkmark.circle.fill").font(.caption).foregroundStyle(.green) }
+                                    }
+                                    Text(option.summary).font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                                }
+                                Spacer(minLength: 8)
+                                if option.githubRepository != nil && !installed {
+                                    Button("Installieren", systemImage: "arrow.down.circle.fill") {
+                                        Task {
+                                            await model.installLauncher(option)
+                                            if model.apkPlan != nil { confirmInstall = true }
+                                            else if model.directAPKPreview != nil { confirmDirectInstall = true }
+                                        }
+                                    }
+                                    .buttonStyle(.borderedProminent).controlSize(.small)
+                                    .disabled(model.isBusy || !model.canWorkWithDevice)
+                                }
+                                Button("Website", systemImage: "safari") { NSWorkspace.shared.open(option.website) }.controlSize(.small)
+                            }.padding(.vertical, 10)
+                            if option.id != LauncherOption.recommended.last?.id { Divider() }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(8)
+                }
+
+                frontendDataBox
+
+                GroupBox("Hintergrundbild") {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Bild vom Mac als Hintergrund setzen").font(.headline)
+                            Text("Das Bild wird übertragen. Den Zuschnitt und „Als Hintergrund festlegen“ bestätigst du danach am Handheld.")
+                                .font(.callout).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("Bild wählen…", systemImage: "photo") { showWallpaperPicker = true }
+                            .disabled(model.isBusy || !model.canWorkWithDevice)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(8)
+                }
+
                 GroupBox("Installierte Apps · Speicher · Deinstallation") {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
@@ -961,8 +1152,6 @@ private struct AppsLauncherView: View {
                             Button("Aktualisieren") { Task { await model.refresh() } }
                                 .disabled(model.isBusy || !model.canWorkWithDevice)
                         }
-                        InfoHint("Speicherwerte stammen aus Androids Datenträgerstatistik und umfassen App, Daten und Cache. System-Apps werden nur für Benutzer 0 entfernt; vor jeder Entfernung ist eine Bestätigung erforderlich.")
-                        InfoHint("Installierte Versionen werden vom Gerät gelesen. Erkannte Emulatoren prüfen automatisch offizielle GitHub-Releases; für andere Apps kannst du die Google-Play-Prüfung starten.")
                         if model.appUpdatesBusy { Label("Offizielle Updatequellen werden geprüft…", systemImage: "arrow.triangle.2.circlepath").font(.caption).foregroundStyle(.secondary) }
                         if let packages = device?.packages {
                             let filtered = packages.filter {
@@ -1054,6 +1243,9 @@ private struct AppsLauncherView: View {
             }
             .padding(22)
         }
+        .fileImporter(isPresented: $showWallpaperPicker, allowedContentTypes: [.image], allowsMultipleSelection: false) { result in
+            if case .success(let urls) = result, let url = urls.first { Task { await model.setWallpaper(url) } }
+        }
         .fileImporter(isPresented: $showAPKPicker, allowedContentTypes: [.data], allowsMultipleSelection: true) { result in
             switch result {
             case .success(let urls):
@@ -1083,6 +1275,10 @@ private struct AppsLauncherView: View {
                      : "\(package.displayTitle) (\(package.packageName)) und die zugehörigen App-Daten werden von diesem Gerät deinstalliert.")
             }
         }
+        .alert("Sicherung zurückspielen?", isPresented: Binding(get: { model.frontendRestorePlan != nil }, set: { if !$0 { model.frontendRestorePlan = nil } })) {
+            Button("Zurückspielen") { Task { await model.applyFrontendRestore() } }
+            Button("Abbrechen", role: .cancel) { model.frontendRestorePlan = nil }
+        } message: { Text(frontendRestoreMessage) }
         .alert("APK installieren?", isPresented: $confirmInstall) {
             Button("Installieren / aktualisieren") { Task { await model.installAPKPlan() } }
             Button("Abbrechen", role: .cancel) { }
@@ -1265,8 +1461,8 @@ private struct RomLibraryView: View {
             }
         }
         .confirmationDialog("ROM löschen?", isPresented: Binding(get: { deleteTarget != nil }, set: { if !$0 { deleteTarget = nil } }), titleVisibility: .visible, presenting: deleteTarget) { game in
-            Button("In Papierkorb verschieben") { Task { await model.deleteROM(game, permanently: false) } }
-            Button("Endgültig löschen", role: .destructive) { Task { await model.deleteROM(game, permanently: true) } }
+            Button("In Papierkorb verschieben") { model.confirmAgain("Wirklich in den Papierkorb verschieben?", "\(game.title) und zugehörige Track-Dateien werden auf dem Handheld in den Papierkorb verschoben.", label: "Ja, verschieben") { Task { await model.deleteROM(game, permanently: false) } } }
+            Button("Endgültig löschen", role: .destructive) { model.confirmAgain("Wirklich endgültig löschen?", "\(game.title) wird dauerhaft gelöscht. Zur Sicherheit noch einmal: Das Löschen kann nicht rückgängig gemacht werden.") { Task { await model.deleteROM(game, permanently: true) } } }
             Button("Abbrechen", role: .cancel) { }
         } message: { game in
             Text("\(game.title) und zugehörige Track-Dateien werden vom Gerät entfernt. Im Papierkorb bleiben sie auf dem Handheld erhalten, bis du sie dort löschst.")
@@ -1799,11 +1995,12 @@ private struct EmulatorProfilesView: View {
     private func saveSelectedDeviceConfigs() {
         let paths = Array(selectedDeviceConfigPaths).sorted()
         guard !paths.isEmpty else { return }
-        let panel = NSOpenPanel()
-        panel.title = "Lokalen Ordner für Emulator-Configs wählen"
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
+        let panel = NSSavePanel()
+        panel.title = "Emulator-Configs sichern"
+        panel.message = "Wähle Name und Ort des Ordners, in dem die gesicherten Configs liegen sollen."
+        panel.prompt = "Sichern"
+        panel.nameFieldStringValue = "\(model.selectedPackage?.displayTitle ?? "Emulator") Configs"
+        panel.canCreateDirectories = true
         guard panel.runModal() == .OK, let directory = panel.url else { return }
         Task {
             let exported = await model.exportCurrentConfigFiles(paths, to: directory)

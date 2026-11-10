@@ -145,6 +145,7 @@ actor AppUpdateService {
             let n = name.lowercased()
             var value = 0
             if n.contains("arm64") || n.contains("aarch64") { value += 10 }
+            else if n.contains("64") && !n.contains("x86") { value += 8 }   // e.g. "_android64.apk"
             if n.contains("universal") { value += 4 }
             if n.contains("x86") { value -= 10 }
             if n.contains("armeabi") || n.contains("armv7") || n.contains("arm32") { value -= 5 }
@@ -152,6 +153,15 @@ actor AppUpdateService {
             return value
         }
         return assets.filter { $0.url != nil && $0.name.lowercased().hasSuffix(".apk") }.max { score($0.name) < score($1.name) }
+    }
+
+    /// Newest stable APK of a GitHub project (used to install apps that are not on the device yet).
+    func latestAPK(repository: String, name: String) async -> (version: String, assetName: String, url: URL)? {
+        let source = UpdateSource(key: "github:\(repository)", name: name, url: URL(string: "https://github.com/\(repository)/releases")!,
+                                  kind: .github(repository: repository, includePrerelease: false))
+        guard let release = try? await Self.fetchLatest(source, session: session),
+              let apk = Self.bestAPK(release.assets), let url = apk.url else { return nil }
+        return (release.version, apk.name, url)
     }
 
     private static func source(for package: InstalledPackage) -> UpdateSource {

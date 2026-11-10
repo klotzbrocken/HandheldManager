@@ -52,6 +52,12 @@ final class AppModel: ObservableObject {
     @Published var romCatalogMessage: String?
     @Published var romCatalogBusy = false
     @Published var romImport: [ROMImportItem]?
+    @Published var finalConfirmation: FinalConfirmation?
+    @Published var frontendEntries: [FrontendDataEntry] = []
+    @Published var frontendSelection: Set<String> = []
+    @Published var frontendScanMessage: String?
+    @Published var frontendRestorePlan: FrontendRestorePlan?
+    private var frontendScanVolume: StorageVolume?
     @Published var signatureMismatchPackages: Set<String> = []
     private var romConsoleFolders: [String: String] = [:]
     private var pendingUpdatePackage: String?
@@ -182,6 +188,21 @@ final class AppModel: ObservableObject {
 
     /// Works out which device folder belongs to which console (from scanned games and from folder names),
     /// then opens the import sheet so the user can confirm or fix the console per file.
+    struct FinalConfirmation {
+        let title: String
+        let message: String
+        let confirmLabel: String
+        let action: () -> Void
+    }
+
+    /// Second, separate confirmation for file deletion. Shown after the first dialog has closed.
+    func confirmAgain(_ title: String, _ message: String, label: String = "Ja, löschen", action: @escaping () -> Void) {
+        Task {
+            try? await Task.sleep(for: .milliseconds(400))
+            finalConfirmation = FinalConfirmation(title: title, message: message, confirmLabel: label, action: action)
+        }
+    }
+
     func prepareROMImport(_ urls: [URL]) async {
         guard let connection = selectedConnection, connection.state == "device", let volume = romVolume,
               let fileService, !romFolderPath.isEmpty else {
@@ -814,6 +835,148 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Copies the image to Pictures/HandheldManager and opens Android's wallpaper crop/confirm screen.
+    /// Android does not allow silently changing the wallpaper over ADB, so the last tap happens on the device.
+    func setWallpaper(_ localURL: URL) async {
+        guard let connection = selectedConnection, connection.state == "device", let adb, let fileService,
+              let volume = descriptor?.volumes.first(where: { $0.kind == .internalStorage && $0.readable }) else {
+            errorMessage = "Kein lesbarer interner Speicher gefunden."
+            return
+        }
+        let accessed = localURL.startAccessingSecurityScopedResource()
+        defer { if accessed { localURL.stopAccessingSecurityScopedResource() } }
+        let folder = volume.path + "/Pictures/HandheldManager"
+        let destination = folder + "/" + localURL.lastPathComponent
+        await perform("Hintergrundbild wird übertragen…") {
+            _ = try await adb.shell(serial: connection.serial, "mkdir -p \(RemotePath.shellQuote(folder))")
+            let preview = try await fileService.previewUpload(serial: connection.serial, local: localURL, destination: destination, volume: volume)
+            _ = try await fileService.upload(serial: connection.serial, local: localURL, destination: destination, volume: volume, replaceExisting: preview.destinationExists, expectedPreview: preview)
+            _ = try? await adb.shell(serial: connection.serial, "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d \(RemotePath.shellQuote("file://" + destination))")
+            let query = try? await adb.shell(serial: connection.serial, "content query --uri content://media/external/images/media --projection _id --where \(RemotePath.shellQuote("_data='\(destination)'"))")
+            let mediaID = query?.standardOutput.range(of: #"_id=(\d+)"#, options: .regularExpression).map { String(query!.standardOutput[$0]).replacingOccurrences(of: "_id=", with: "") }
+            var opened = false
+            if let mediaID {
+                let uri = "content://media/external/images/media/\(mediaID)"
+                opened = (try? await adb.shell(serial: connection.serial, "am start -a android.intent.action.ATTACH_DATA -d \(uri) -t image/* --grant-read-uri-permission")) != nil
+                if !opened { opened = (try? await adb.shell(serial: connection.serial, "am start -a android.intent.action.SET_WALLPAPER -d \(uri) -t image/*")) != nil }
+            }
+            if !opened { _ = try? await adb.shell(serial: connection.serial, "am start -a android.intent.action.SET_WALLPAPER") }
+            self.statusMessage = "Bild liegt unter \(destination). Bestätige jetzt am Handheld den Zuschnitt und „Als Hintergrund festlegen“; öffnet sich nichts, wähle das Bild dort in der Galerie."
+        }
+    }
+
+    // MARK: Frontend data backup (Daijishō, Pegasus, ES-DE …)
+
+    /// Looks for the frontend's data folders in shared storage and lists their top-level entries with sizes.
+    func scanFrontendData(_ option: LauncherOption) async {
+        guard let connection = selectedConnection, connection.state == "device", let adb else { return }
+        frontendEntries = []
+        frontendSelection = []
+        frontendScanMessage = nil
+        await perform("\(option.name): Daten werden gesucht…") {
+            for volume in (self.descriptor?.volumes ?? []).filter(\.readable) {
+                var entries: [FrontendDataEntry] = []
+                for folder in option.dataFolders {
+                    let root = volume.path + "/" + folder
+                    guard (try? await adb.remoteExists(serial: connection.serial, path: root)) == true else { continue }
+                    let out = try await adb.shell(serial: connection.serial, "du -sk \(RemotePath.shellQuote(root))/* 2>/dev/null", timeout: 180)
+                    for line in out.standardOutput.split(whereSeparator: \.isNewline) {
+                        let parts = line.split(separator: "\t", maxSplits: 1)
+                        guard parts.count == 2, let kb = Int64(parts[0]) else { continue }
+                        let path = String(parts[1]).trimmingCharacters(in: .whitespaces)
+                        let isDirectory = (try? await adb.shell(serial: connection.serial, "[ -d \(RemotePath.shellQuote(path)) ] && echo D || echo F"))?.standardOutput.contains("D") == true
+                        entries.append(FrontendDataEntry(path: path, sizeBytes: kb * 1024, isDirectory: isDirectory))
+                    }
+                }
+                if !entries.isEmpty {
+                    self.frontendScanVolume = volume
+                    self.frontendEntries = entries.sorted { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+                    // Small things (settings, lists) on by default; big media folders stay off.
+                    self.frontendSelection = Set(entries.filter { $0.sizeBytes <= 100 * 1024 * 1024 }.map(\.path))
+                    self.statusMessage = "\(entries.count) Eintrag/Einträge für \(option.name) auf \(volume.name) gefunden."
+                    return
+                }
+            }
+            self.frontendScanMessage = "\(option.name) hat im gemeinsamen Speicher keine Daten abgelegt. Öffne die App einmal und lege dort einen Datenordner an, oder nutze die eigene Sicherung der App."
+        }
+    }
+
+    func backupFrontendData(_ option: LauncherOption, to directory: URL) async -> URL? {
+        guard let connection = selectedConnection, connection.state == "device", let adb,
+              let volume = frontendScanVolume else { return nil }
+        let chosen = frontendEntries.filter { frontendSelection.contains($0.path) }
+        guard !chosen.isEmpty else { errorMessage = "Wähle mindestens einen Eintrag aus."; return nil }
+        var done = false
+        await perform("\(option.name): Daten werden gesichert…") {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            var items: [FrontendBackupManifest.Item] = []
+            for entry in chosen {
+                let relative = String(entry.path.dropFirst(volume.path.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                let local = directory.appendingPathComponent(relative)
+                guard !FileManager.default.fileExists(atPath: local.path) else { throw ManagerError.destinationExists(local.path) }
+                try FileManager.default.createDirectory(at: local.deletingLastPathComponent(), withIntermediateDirectories: true)
+                self.busyLabel = "\(entry.name) wird gesichert…"
+                try await adb.pull(serial: connection.serial, remote: entry.path, local: local.deletingLastPathComponent())
+                let remote = try await adb.remoteTreeStats(serial: connection.serial, path: entry.path)
+                guard LocalTree.stats(local) == remote else {
+                    try? FileManager.default.removeItem(at: local)
+                    throw ManagerError.commandFailed("Sicherung von \(entry.name) stimmt nicht mit dem Gerät überein (Dateianzahl oder Größe).")
+                }
+                items.append(.init(relativePath: relative, isDirectory: entry.isDirectory, sizeBytes: remote.bytes))
+            }
+            let manifest = FrontendBackupManifest(packageName: option.packageName, deviceSerial: connection.serial, volumeKind: volume.kind.rawValue, createdAt: Date(), items: items)
+            try JSONEncoder.profileEncoder.encode(manifest).write(to: directory.appendingPathComponent("handheld-frontend-backup.json"), options: .atomic)
+            self.statusMessage = "\(items.count) Eintrag/Einträge von \(option.name) gesichert und geprüft."
+            done = true
+        }
+        return done ? directory : nil
+    }
+
+    func prepareFrontendRestore(from folder: URL) async {
+        guard let connection = selectedConnection, connection.state == "device", let adb else { return }
+        let manifestURL = folder.appendingPathComponent("handheld-frontend-backup.json")
+        guard let data = try? Data(contentsOf: manifestURL),
+              let manifest = try? JSONDecoder().decode(FrontendBackupManifest.self, from: data) else {
+            errorMessage = "In diesem Ordner liegt keine Frontend-Sicherung (handheld-frontend-backup.json fehlt)."
+            return
+        }
+        guard let volume = descriptor?.volumes.first(where: { $0.kind.rawValue == manifest.volumeKind && $0.readable }) else {
+            errorMessage = "Der Speichertyp der Sicherung ist auf diesem Gerät nicht verfügbar."
+            return
+        }
+        var existing = Set<String>()
+        for item in manifest.items {
+            let remote = volume.path + "/" + item.relativePath
+            if (try? await adb.remoteExists(serial: connection.serial, path: remote)) == true { existing.insert(item.relativePath) }
+        }
+        frontendRestorePlan = FrontendRestorePlan(manifest: manifest, folder: folder, volume: volume, existing: existing)
+    }
+
+    func applyFrontendRestore() async {
+        guard let connection = selectedConnection, connection.state == "device", let adb, let fileService,
+              let plan = frontendRestorePlan else { return }
+        frontendRestorePlan = nil
+        await perform("Frontend-Daten werden zurückgespielt…") {
+            for item in plan.manifest.items {
+                let local = plan.folder.appendingPathComponent(item.relativePath)
+                guard FileManager.default.fileExists(atPath: local.path) else { throw ManagerError.commandFailed("In der Sicherung fehlt \(item.relativePath).") }
+                let remote = try RemotePath.normalized(plan.volume.path + "/" + item.relativePath, within: plan.volume)
+                let parent = (remote as NSString).deletingLastPathComponent
+                self.busyLabel = "\((remote as NSString).lastPathComponent) wird zurückgespielt…"
+                if plan.existing.contains(item.relativePath) {
+                    self.lastQuarantine = try await fileService.quarantine(serial: connection.serial, path: remote, volume: plan.volume)
+                }
+                _ = try await adb.shell(serial: connection.serial, "mkdir -p \(RemotePath.shellQuote(parent))")
+                let size = LocalTree.stats(local).bytes
+                try await adb.push(serial: connection.serial, local: local, remote: item.isDirectory ? parent + "/" : remote, timeout: max(300, Double(size) / 2_000_000))
+                guard try await adb.remoteTreeStats(serial: connection.serial, path: remote) == LocalTree.stats(local) else {
+                    throw ManagerError.commandFailed("Zurückgespielte Daten von \((remote as NSString).lastPathComponent) stimmen nicht mit der Sicherung überein. Die vorherige Version liegt im Papierkorb des Geräts.")
+                }
+            }
+            self.statusMessage = "\(plan.manifest.items.count) Eintrag/Einträge zurückgespielt. Vorherige Versionen liegen im Papierkorb auf dem Gerät."
+        }
+    }
+
     func openHomeSettings() async {
         guard let connection = selectedConnection, connection.state == "device", let discovery else { return }
         await perform("Android-Launcherauswahl wird geöffnet…") {
@@ -1009,12 +1172,29 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Downloads the update APK from its official release, then runs it through the normal
-    /// check (package, version, signature vs. installed app) so the user only has to confirm.
     func downloadUpdate(_ package: InstalledPackage) async {
-        guard canWorkWithDevice, let source = package.updateDownloadURL else { return }
+        guard let source = package.updateDownloadURL else { return }
+        await downloadAndPrepareAPK(title: package.displayTitle, source: source, assetName: package.updateAssetName, packageName: package.packageName)
+    }
+
+    /// Looks up the newest APK of a recommended launcher/frontend and prepares its installation.
+    func installLauncher(_ option: LauncherOption) async {
+        guard canWorkWithDevice, let repository = option.githubRepository else { return }
+        var found: (version: String, assetName: String, url: URL)?
+        await perform("\(option.name): neueste Version wird gesucht…") {
+            found = await self.appUpdateService.latestAPK(repository: repository, name: option.name)
+            if found == nil { throw ManagerError.commandFailed("Keine passende APK im neuesten Release gefunden. Öffne die Website der Quelle.") }
+        }
+        guard let found else { return }
+        await downloadAndPrepareAPK(title: option.name, source: found.url, assetName: found.assetName, packageName: option.packageName)
+    }
+
+    /// Downloads an APK from its official release, then runs it through the normal check
+    /// (package, version, signature vs. installed app) so the user only has to confirm.
+    private func downloadAndPrepareAPK(title: String, source: URL, assetName: String?, packageName: String) async {
+        guard canWorkWithDevice else { return }
         var downloaded: URL?
-        await perform("\(package.displayTitle) wird geladen…") {
+        await perform("\(title) wird geladen…") {
             let folder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
                 .appendingPathComponent("HandheldManager/Downloads", isDirectory: true)
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -1025,15 +1205,15 @@ final class AppModel: ObservableObject {
             guard (response as? HTTPURLResponse).map({ (200..<300).contains($0.statusCode) }) == true else {
                 throw ManagerError.commandFailed("Download fehlgeschlagen. Öffne die Quelle im Browser.")
             }
-            let name = (package.updateAssetName ?? source.lastPathComponent).replacingOccurrences(of: "/", with: "_")
+            let name = (assetName ?? source.lastPathComponent).replacingOccurrences(of: "/", with: "_")
             let destination = folder.appendingPathComponent(name)
             try? FileManager.default.removeItem(at: destination)
             try FileManager.default.moveItem(at: temporary, to: destination)
             downloaded = destination
         }
         guard errorMessage == nil, let downloaded else { return }
-        if apkToolsAvailable { await prepareAPKUpdate([downloaded]) } else { prepareDirectAPKInstall([downloaded]); pendingUpdatePackage = package.packageName }
-        if errorMessage == nil { statusMessage = "\(package.displayTitle) geladen und geprüft. Bitte Installation bestätigen." }
+        if apkToolsAvailable { await prepareAPKUpdate([downloaded]) } else { prepareDirectAPKInstall([downloaded]); pendingUpdatePackage = packageName }
+        if errorMessage == nil { statusMessage = "\(title) geladen und geprüft. Bitte Installation bestätigen." }
     }
 
     func prepareDirectAPKInstall(_ urls: [URL]) {
@@ -1052,8 +1232,10 @@ final class AppModel: ObservableObject {
             catch { self.noteInstallFailure(error, package: self.pendingUpdatePackage); throw error }
             self.directAPKPreview = nil
             self.pendingUpdatePackage = nil
+            try await self.loadDescriptor(connection)   // show the new version instead of the stale list
             self.statusMessage = "\(preview.fileName) wurde von Android angenommen und installiert."
         }
+        if errorMessage == nil { await checkUpdates(descriptor?.packages.filter { $0.isEmulator == true } ?? []) }
     }
 
     private func noteInstallFailure(_ error: Error, package: String?) {
@@ -1089,6 +1271,7 @@ final class AppModel: ObservableObject {
             self.apkPlan = nil
             self.statusMessage = "\(plan.packageName) · Version \(plan.versionCode) installiert und Signatur verifiziert."
         }
+        if errorMessage == nil { await checkUpdates(descriptor?.packages.filter { $0.isEmulator == true } ?? []) }
     }
 
     func discardAPKPlan() {

@@ -123,6 +123,35 @@ struct HomeActivity: Identifiable, Hashable {
     let packageName: String
     let componentName: String
     var id: String { componentName }
+
+    /// Human-readable launcher name. ADB cannot read app labels, so known launchers come from a small
+    /// list and everything else gets a tidied-up package name.
+    var displayName: String {
+        let known = [
+            "com.android.launcher3": "Launcher3 (Android Standard)",
+            "com.retroidpocket.gamelauncher": "Retroid Game Launcher",
+            "com.smslv.trinketos": "TrinketOS",
+            "com.spocky.projengmenu": "Projectivy Launcher",
+            "org.es_de.frontend": "ES-DE Frontend",
+            "com.android.settings": "Einstellungen",
+            "com.anbernic.launcher": "ANBERNIC Launcher",
+            "com.ayaneo.launcher": "AYANEO Launcher",
+            "com.odin.launcher": "ODIN Launcher",
+            "com.teslacoilsw.launcher": "Nova Launcher",
+            "net.kdt.pojavlaunch": "Pojav Launcher",
+            "app.lawnchair": "Lawnchair",
+            "com.google.android.apps.nexuslauncher": "Pixel Launcher",
+            "com.android.quickstep": "Quickstep",
+            "com.sec.android.app.launcher": "One UI Home",
+            "com.miui.home": "MIUI Home",
+            "com.retroarch": "RetroArch",
+            "com.magneticchen.daijishou": "Daijishō",
+            "com.explusalpha.nostalgia": "Nostalgia",
+        ]
+        if let name = known[packageName] { return name }
+        let last = packageName.split(separator: ".").last.map(String.init) ?? packageName
+        return last.replacingOccurrences(of: "_", with: " ").capitalized
+    }
 }
 
 struct APKArtifact: Identifiable, Hashable {
@@ -355,4 +384,55 @@ struct ROMImportItem: Identifiable {
     let id = UUID()
     let url: URL
     var platform: String   // empty = not assigned yet
+}
+
+/// Launchers and frontends worth installing on a handheld. GitHub entries can be downloaded in-app,
+/// the others open their official page.
+struct LauncherOption: Identifiable {
+    let name: String
+    let summary: String
+    let packageName: String
+    let githubRepository: String?
+    let website: URL
+    /// Folders (relative to a storage volume) where the frontend keeps its data; empty = private only.
+    var dataFolders: [String] = []
+    var id: String { packageName }
+
+    static let recommended: [LauncherOption] = [
+        .init(name: "Daijishō", summary: "Retro-Frontend mit Plattform-Playlists, Covern und Emulator-Starter. Beliebt auf Handhelds.",
+              packageName: "com.magneticchen.daijishou", githubRepository: "TapiocaFox/Daijishou", website: URL(string: "https://daijishou.com")!,
+              dataFolders: ["Daijishou", "Android/data/com.magneticchen.daijishou/files"]),
+        .init(name: "Pegasus", summary: "Quelloffenes, anpassbares Frontend mit Themes. Konfiguration über Dateien im Speicher.",
+              packageName: "org.pegasus_frontend.android", githubRepository: "mmatyas/pegasus-frontend", website: URL(string: "https://pegasus-frontend.org")!,
+              dataFolders: ["pegasus-frontend", "Android/data/org.pegasus_frontend.android/files"]),
+        .init(name: "ES-DE", summary: "Die bekannte EmulationStation-Oberfläche für Android. Wird über die Projektseite bezogen.",
+              packageName: "org.es_de.frontend", githubRepository: nil, website: URL(string: "https://es-de.org")!,
+              dataFolders: ["ES-DE"]),
+        .init(name: "Projectivy Launcher", summary: "Flexibler Launcher mit Backup und Import des Layouts. Wird über Google Play bezogen.",
+              packageName: "com.spocky.projengmenu", githubRepository: nil, website: URL(string: "https://play.google.com/store/apps/details?id=com.spocky.projengmenu")!),
+    ]
+}
+
+struct FrontendDataEntry: Identifiable, Hashable {
+    let path: String
+    let sizeBytes: Int64
+    let isDirectory: Bool
+    var id: String { path }
+    var name: String { (path as NSString).lastPathComponent }
+}
+
+struct FrontendBackupManifest: Codable {
+    struct Item: Codable { let relativePath: String; let isDirectory: Bool; let sizeBytes: Int64 }
+    let packageName: String
+    let deviceSerial: String
+    let volumeKind: String
+    let createdAt: Date
+    let items: [Item]
+}
+
+struct FrontendRestorePlan {
+    let manifest: FrontendBackupManifest
+    let folder: URL
+    let volume: StorageVolume
+    let existing: Set<String>   // relative paths that already exist on the device
 }

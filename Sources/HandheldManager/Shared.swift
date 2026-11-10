@@ -107,3 +107,35 @@ extension ADBClient {
         return try Hash.sha256(file: copy)
     }
 }
+
+struct TreeStats: Equatable { var files = 0; var bytes: Int64 = 0 }
+
+enum LocalTree {
+    static func stats(_ url: URL) -> TreeStats {
+        var result = TreeStats()
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else { return result }
+        if !isDirectory.boolValue {
+            result.files = 1
+            result.bytes = ((try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? NSNumber)?.int64Value ?? 0
+            return result
+        }
+        let keys: [URLResourceKey] = [.isRegularFileKey, .fileSizeKey]
+        guard let enumerator = FileManager.default.enumerator(at: url, includingPropertiesForKeys: keys) else { return result }
+        for case let file as URL in enumerator {
+            let values = try? file.resourceValues(forKeys: Set(keys))
+            if values?.isRegularFile == true { result.files += 1; result.bytes += Int64(values?.fileSize ?? 0) }
+        }
+        return result
+    }
+}
+
+extension ADBClient {
+    /// File count and total bytes below a remote path (or of the single file).
+    func remoteTreeStats(serial: String, path: String) async throws -> TreeStats {
+        let out = try await shell(serial: serial, "find \(RemotePath.shellQuote(path)) -type f -exec stat -c %s {} + 2>/dev/null | awk '{s+=$1;n++} END{print n+0, s+0}'", timeout: 300)
+        let parts = out.standardOutput.split(whereSeparator: \.isWhitespace)
+        guard parts.count == 2, let files = Int(parts[0]), let bytes = Int64(parts[1]) else { throw ManagerError.commandFailed("Dateistatistik von \(path) nicht lesbar.") }
+        return TreeStats(files: files, bytes: bytes)
+    }
+}
